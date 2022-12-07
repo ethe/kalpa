@@ -1,17 +1,42 @@
 [package]
-name = "executor"
+name = "kalpa"
 version = "0.1.0"
 edition = "2021"
+license-file = "LICENSE"
+
+[features]
+io = ["mio/os-poll", "mio/os-ext"]
+blocking = []
+net = ["io", "mio/net", "socket2/all", "libc"]
+tokio = ["net", "dep:tokio"]
+all = ["blocking", "tokio"]
 
 [dependencies]
-async-task = "4.3"
-crossbeam-channel = "0.5"
+async-task = "4"
 crossbeam-queue = "0.3"
-futures-lite = "1.12"
-libc = "0.2"
-mio = { version = "0.8", features = ["os-poll", "os-ext"] }
-once_cell = "1.16"
+event-listener = "2"
+futures-lite = "1"
+futures-util = "0.3"
+libc = { version = "0.2", optional = true }
+mio = { version = "0.8", optional = true }
+once_cell = "1"
 slab = "0.4"
-socket2 = { version = "0.4", features = ["all"]}
-tokio = "1.21"
+socket2 = { version = "0.4", optional = true }
+tokio = { version = "1", default-features = false, optional = true }
 tracing = "0.1"
+waker-fn = "1"
+
+[dev-dependencies]
+hyper = { version = "0.14", features = ["server", "http1", "client", "http2", "tcp"] }
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+debug = true
+
+[[example]]
+name = "hyper"
+required-features = ["tokio"]
+
+[[bench]]
+name = "tokio"
+harness = false

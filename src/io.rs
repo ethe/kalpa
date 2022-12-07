@@ -1,10 +1,11 @@
-use std::{io, os::fd::AsRawFd, task::Waker, time::Duration};
+use std::{io, task::Waker, time::Duration};
 
-use mio::{unix::SourceFd, Events, Interest, Poll, Token};
+pub use mio::Interest;
+use mio::{event, Events, Poll, Token};
 use slab::Slab;
 
 #[derive(Debug)]
-pub(crate) struct Poller {
+pub struct Poller {
     poller: Poll,
     events: Events,
     active: Slab<Option<Waker>>,
@@ -39,35 +40,31 @@ impl Poller {
         mio::Waker::new(self.poller.registry(), Token(self.active.insert(None)))
     }
 
-    pub(crate) fn register<Fd: AsRawFd>(
-        &mut self,
-        fd: &Fd,
-        interests: Interest,
-    ) -> io::Result<usize> {
+    pub fn register<S>(&mut self, source: &mut S, interests: Interest) -> io::Result<usize>
+    where
+        S: event::Source + ?Sized,
+    {
         let entry = self.active.vacant_entry();
         let key = entry.key();
         self.poller
             .registry()
-            .register(&mut SourceFd(&fd.as_raw_fd()), Token(key), interests)?;
+            .register(source, Token(key), interests)?;
         entry.insert(None);
         Ok(key)
     }
 
-    pub(crate) fn add(&mut self, id: usize, waker: Waker) {
+    pub fn add(&mut self, id: usize, waker: Waker) {
         *self.active.get_mut(id).unwrap() = Some(waker);
     }
 
-    pub(crate) fn deregister<Fd: AsRawFd>(&mut self, id: usize, fd: &Fd) {
+    pub fn deregister<S>(&mut self, id: usize, source: &mut S)
+    where
+        S: event::Source + ?Sized,
+    {
         self.active.remove(id);
         self.poller
             .registry()
-            .deregister(&mut SourceFd(&fd.as_raw_fd()))
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "deregister polling event failed, fd: {}, e: {}",
-                    fd.as_raw_fd(),
-                    e
-                )
-            });
+            .deregister(source)
+            .unwrap_or_else(|e| tracing::warn!("deregister polling event failed, e: {}", e));
     }
 }

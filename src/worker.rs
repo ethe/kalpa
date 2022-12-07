@@ -4,39 +4,52 @@ use std::{
     future::Future,
     panic::{RefUnwindSafe, UnwindSafe},
     sync::Arc,
-    time::Duration,
+    task::Waker,
 };
 
 use async_task::Runnable;
 use crossbeam_queue::SegQueue;
 use futures_lite::future;
-use mio::Waker;
 use once_cell::unsync::OnceCell;
+use slab::Slab;
 
+#[cfg(feature = "io")]
 use super::io::Poller;
 
-const NR_TASKS: usize = 256;
+pub(crate) const NR_TASKS: usize = 256;
 
 thread_local! {
-    pub(crate) static ID: OnceCell<usize> = OnceCell::new();
-    pub(crate) static CONTEXT: OnceCell<Context> = OnceCell::new();
+    pub static CONTEXT: OnceCell<Context> = OnceCell::new();
 }
 
 #[derive(Debug)]
-pub(crate) struct Context {
+pub struct Context {
+    pub(crate) id: usize,
     pub(crate) local: RefCell<VecDeque<Runnable>>,
     pub(crate) assigned: Arc<SegQueue<Runnable>>,
-    pub(crate) poller: RefCell<Poller>,
-    pub(crate) waker: Arc<Waker>,
+    #[cfg(feature = "io")]
+    pub poller: RefCell<Poller>,
+    #[cfg(feature = "io")]
+    pub waker: Arc<mio::Waker>,
+    pub(crate) active: RefCell<Slab<Waker>>,
 }
 
 impl Context {
-    fn new(assigned: Arc<SegQueue<Runnable>>, poller: Poller, waker: Arc<Waker>) -> Self {
+    fn new(
+        id: usize,
+        assigned: Arc<SegQueue<Runnable>>,
+        #[cfg(feature = "io")] poller: Poller,
+        #[cfg(feature = "io")] waker: Arc<mio::Waker>,
+    ) -> Self {
         Context {
+            id,
             local: RefCell::new(VecDeque::new()),
             assigned,
+            #[cfg(feature = "io")]
             poller: RefCell::new(poller),
+            #[cfg(feature = "io")]
             waker,
+            active: RefCell::new(Slab::new()),
         }
     }
 }
@@ -48,13 +61,21 @@ impl RefUnwindSafe for Worker {}
 
 impl Worker {
     pub(crate) fn new(
+        id: usize,
         assigned: Arc<SegQueue<Runnable>>,
-        poller: Poller,
-        waker: Arc<Waker>,
+        #[cfg(feature = "io")] poller: Poller,
+        #[cfg(feature = "io")] waker: Arc<mio::Waker>,
     ) -> Self {
         CONTEXT.with(|context| {
             context
-                .set(Context::new(assigned, poller, waker))
+                .set(Context::new(
+                    id,
+                    assigned,
+                    #[cfg(feature = "io")]
+                    poller,
+                    #[cfg(feature = "io")]
+                    waker,
+                ))
                 .expect("context can not be setted twice")
         });
         Worker
@@ -65,10 +86,10 @@ impl Worker {
         let run_forever = async move {
             loop {
                 CONTEXT.with(|context| {
-                    let context = unsafe { context.get().unwrap_unchecked() };
+                    let context = context.get().expect("context should be initialized");
                     let mut capacity = NR_TASKS;
 
-                    for _ in 0..(capacity) {
+                    while capacity > 0 {
                         let runnable = context.local.borrow_mut().pop_front();
                         if let Some(runnable) = runnable {
                             runnable.run();
@@ -78,7 +99,7 @@ impl Worker {
                         }
                     }
 
-                    for _ in 0..(capacity) {
+                    while capacity > 0 {
                         if let Some(runnable) = context.assigned.pop() {
                             runnable.run();
                             capacity -= 1;
@@ -90,25 +111,49 @@ impl Worker {
 
                 future::yield_now().await;
 
-                CONTEXT.with(|context| {
-                    let context = context.get().unwrap();
-                    let timeout =
-                        if context.local.borrow().is_empty() && context.assigned.is_empty() {
-                            None
-                        } else {
-                            Some(Duration::ZERO)
-                        };
-                    context
-                        .poller
-                        .borrow_mut()
-                        .poll(timeout)
-                        .unwrap_or_else(|e| tracing::error!("async worker polling failed: {}", e));
-                });
+                #[cfg(feature = "io")]
+                {
+                    use std::time::Duration;
+
+                    CONTEXT.with(|context| {
+                        let context = context.get().expect("context should be initialized");
+                        let timeout =
+                            if context.local.borrow().is_empty() && context.assigned.is_empty() {
+                                None
+                            } else {
+                                Some(Duration::ZERO)
+                            };
+                        context
+                            .poller
+                            .borrow_mut()
+                            .poll(timeout)
+                            .unwrap_or_else(|e| {
+                                tracing::error!("async worker polling failed: {}", e)
+                            });
+                    })
+                }
             }
         };
 
         // Run `future` and `run_forever` concurrently until `future` completes.
         future::or(future, run_forever).await;
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        CONTEXT.with(|context| {
+            let context = context.get().expect("context should be initialized");
+            for waker in context.active.borrow_mut().drain() {
+                waker.wake();
+            }
+            while let Some(runnable) = context.assigned.pop() {
+                drop(runnable);
+            }
+            while let Some(runnable) = context.local.borrow_mut().pop_front() {
+                drop(runnable);
+            }
+        })
     }
 }
 
@@ -141,10 +186,10 @@ mod test {
     }
 
     #[test]
-    fn test_runtime() {
+    fn worker_could_run() {
         let mut poller = Poller::with_capacity(1).unwrap();
         let waker = Arc::new(poller.waker().unwrap());
-        let ex = Worker::new(Arc::new(SegQueue::new()), poller, waker);
+        let ex = Worker::new(0, Arc::new(SegQueue::new()), poller, waker);
 
         let task = spawn_local(async { 1 + 2 });
         future::block_on(ex.run(async {
@@ -154,10 +199,10 @@ mod test {
     }
 
     #[test]
-    fn test_yield() {
+    fn task_coud_be_yielded() {
         let mut poller = Poller::with_capacity(1).unwrap();
         let waker = Arc::new(poller.waker().unwrap());
-        let ex = Worker::new(Arc::new(SegQueue::new()), poller, waker);
+        let ex = Worker::new(0, Arc::new(SegQueue::new()), poller, waker);
 
         let counter = Rc::new(RefCell::new(0));
         let counter1 = Rc::clone(&counter);

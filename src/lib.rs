@@ -1,11 +1,15 @@
+#[cfg(feature = "blocking")]
 mod blocking;
-mod io;
+#[cfg(feature = "io")]
+pub mod io;
+#[cfg(feature = "net")]
 pub mod net;
 mod worker;
 
 use std::{
     future::Future,
     marker::PhantomData,
+    mem::MaybeUninit,
     panic::catch_unwind,
     pin::Pin,
     sync::Arc,
@@ -15,20 +19,27 @@ use std::{
 };
 
 use async_task::{Runnable, Task};
-pub use blocking::spawn_blocking_scoped;
-use blocking::{BlockingWorker, BLOCKING_TASKS};
 use crossbeam_queue::SegQueue;
-use futures_lite::future;
+use event_listener::Event;
+use futures_lite::{future, pin};
+use futures_util::future::join_all;
+#[cfg(feature = "blocking")]
+use once_cell::sync::OnceCell;
+use waker_fn::waker_fn;
+pub use worker::CONTEXT;
 
-use self::{
-    io::Poller,
-    worker::{Worker, CONTEXT, ID},
-};
+#[cfg(feature = "io")]
+use self::io::Poller;
+use self::worker::Worker;
 
-#[must_use = "scoped-task must be awaited in its lifetime"]
+#[cfg(feature = "blocking")]
+static BLOCKING_EXECUTOR: OnceCell<blocking::Executor> = OnceCell::new();
+
+#[must_use = "because it must be awaited in its lifetime"]
+#[repr(transparent)]
 pub struct ScopedTask<'task, T> {
-    task: Task<T>,
-    _marker: PhantomData<&'task ()>,
+    task: MaybeUninit<Task<T>>,
+    _marker: PhantomData<&'task &'task mut ()>,
 }
 
 impl<T> std::panic::UnwindSafe for ScopedTask<'_, T> {}
@@ -37,227 +48,399 @@ impl<T> std::panic::RefUnwindSafe for ScopedTask<'_, T> {}
 impl<T> Future for ScopedTask<'_, T> {
     type Output = T;
 
+    #[inline]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe { self.map_unchecked_mut(|st| &mut st.task).poll(cx) }
+        unsafe { self.map_unchecked_mut(|st| st.task.assume_init_mut()) }.poll(cx)
     }
 }
 
 impl<T> Drop for ScopedTask<'_, T> {
     fn drop(&mut self) {
-        drop(&mut self.task)
+        let task =
+            unsafe { std::mem::replace(&mut self.task, MaybeUninit::uninit()).assume_init() }
+                .cancel();
+        pin!(task);
+        let waker = waker_fn(move || {});
+        let mut cx = Context::from_waker(&waker);
+        if task.as_mut().poll(&mut cx).is_pending() {
+            panic!("cancel scoped task should always success immediately");
+        }
     }
 }
 
-#[derive(Default)]
-pub struct ExecutorBuilder {
-    workers: usize,
-    blocking_workers: usize,
+impl<T> ScopedTask<'_, T> {
+    #[inline]
+    fn new(task: Task<T>) -> Self {
+        ScopedTask {
+            task: MaybeUninit::new(task),
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn is_finished(&self) -> bool {
+        unsafe { self.task.assume_init_ref() }.is_finished()
+    }
 }
 
-impl ExecutorBuilder {
+impl<T> ScopedTask<'static, T> {
+    #[inline]
+    pub fn detach(mut self) {
+        let task = std::mem::replace(&mut self.task, MaybeUninit::uninit());
+        std::mem::forget(self);
+        unsafe { task.assume_init() }.detach()
+    }
+}
+
+pub struct ExecutorBuilder<'executor> {
+    worker_num: usize,
+    #[cfg(feature = "blocking")]
+    max_blocking_thread_num: usize,
+    _marker: PhantomData<&'executor ()>,
+}
+
+impl Default for ExecutorBuilder<'_> {
+    fn default() -> Self {
+        Self {
+            worker_num: std::thread::available_parallelism().unwrap().get(),
+            #[cfg(feature = "blocking")]
+            max_blocking_thread_num: usize::MAX,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'executor> ExecutorBuilder<'executor> {
     pub fn new() -> Self {
         Default::default()
     }
 
-    pub fn workers(self, num: usize) -> Self {
+    pub fn worker_num(self, num: usize) -> Self {
         Self {
-            workers: num,
-            blocking_workers: self.blocking_workers,
+            worker_num: num,
+            #[cfg(feature = "blocking")]
+            max_blocking_thread_num: self.max_blocking_thread_num,
+            _marker: PhantomData,
         }
     }
 
-    pub fn blocking_workers(self, num: usize) -> Self {
+    #[cfg(feature = "blocking")]
+    pub fn max_blocking_thread_num(self, num: usize) -> Self {
         Self {
-            workers: self.workers,
-            blocking_workers: num,
+            worker_num: self.worker_num,
+            max_blocking_thread_num: num,
+            _marker: PhantomData,
         }
     }
 
-    pub fn build(self) -> std::io::Result<Executor> {
-        Ok(Executor::new(self.workers, self.blocking_workers))
+    pub fn build(self) -> std::io::Result<Executor<'executor>> {
+        Executor::new(
+            self.worker_num,
+            #[cfg(feature = "blocking")]
+            self.max_blocking_thread_num,
+        )
     }
 }
 
 struct WorkerHandler {
     join: JoinHandle<()>,
     assigned: Arc<SegQueue<Runnable>>,
+    #[cfg(feature = "io")]
     waker: Arc<mio::Waker>,
 }
 
-pub struct Executor {
+pub struct Executor<'executor> {
     workers: Vec<WorkerHandler>,
-    blocking_workers: Vec<JoinHandle<()>>,
+    closer: Arc<Event>,
+    _marker: PhantomData<&'executor ()>,
 }
 
-unsafe impl Send for Executor {}
-unsafe impl Sync for Executor {}
+unsafe impl Send for Executor<'_> {}
+unsafe impl Sync for Executor<'_> {}
 
-impl Drop for Executor {
+impl Drop for Executor<'_> {
     fn drop(&mut self) {
-        for join in self.blocking_workers.drain(..) {
-            join.join().unwrap();
-        }
-        for ex in self.workers.drain(..) {
-            ex.waker.wake().expect("wake async worke failed");
-            ex.join.join().unwrap();
+        self.closer.notify(self.workers.len());
+        for worker in self.workers.drain(..) {
+            #[cfg(feature = "io")]
+            worker
+                .waker
+                .wake()
+                .expect("wake worker to accpet spawned task must be successed");
+            worker
+                .join
+                .join()
+                .expect("blocking worker should successfully exit");
         }
     }
 }
 
-impl Executor {
-    pub fn new(workers: usize, blocking_workers: usize) -> Self {
-        let workers = (0..workers)
-            .into_iter()
-            .map(|id| {
-                let assigned = Arc::new(SegQueue::new());
-                let local_assigned = Arc::clone(&assigned);
-                let mut poller = Poller::with_capacity(256).expect("initialize poller error");
-                let waker = Arc::new(poller.waker().expect("try get poller waker failed"));
-                let local_waker = waker.clone();
+impl<'executor> Executor<'executor> {
+    pub fn builder() -> ExecutorBuilder<'executor> {
+        ExecutorBuilder::new()
+    }
 
-                let join = thread::Builder::new()
-                    .name(format!("async-worker-{}", id))
-                    .spawn(move || {
-                        ID.with(|thread_id| {
-                            thread_id.set(id).unwrap();
-                        });
+    fn new(
+        worker_num: usize,
+        #[cfg(feature = "blocking")] max_blocking_thread_num: usize,
+    ) -> std::io::Result<Self> {
+        let closer = Arc::new(Event::new());
+        let mut workers = Vec::with_capacity(worker_num);
 
-                        let executor = Worker::new(local_assigned, poller, local_waker);
+        for worker_id in 0..worker_num {
+            let assigned = Arc::new(SegQueue::new());
+            let closer = Arc::clone(&closer);
 
-                        loop {
-                            match catch_unwind(|| {
-                                future::block_on(executor.run(async move {
-                                    // TODO: use atomic object to graceful exition
-                                    futures_lite::future::pending::<()>().await;
-                                }));
-                            }) {
-                                Ok(()) => break,
-                                Err(_) => tracing::error!("async worker paniced"),
-                            }
-                        }
-                    })
-                    .expect("failed to spawn async worker thread");
+            workers.push(Self::create_worker_handler(worker_id, assigned, closer)?);
+        }
 
-                WorkerHandler {
-                    join,
-                    assigned,
-                    waker,
-                }
-            })
-            .collect();
+        #[cfg(feature = "blocking")]
+        BLOCKING_EXECUTOR.get_or_init(|| blocking::Executor::new(max_blocking_thread_num));
 
-        let (send, recv) = crossbeam_channel::unbounded();
-        let blocking_workers = (0..blocking_workers)
-            .into_iter()
-            .map(|id| {
-                let recv = recv.clone();
-                thread::Builder::new()
-                    .name(format!("blocking-worker-{}", id))
-                    .spawn(|| {
-                        let worker = BlockingWorker::new(recv);
-                        loop {
-                            match catch_unwind(|| worker.run()) {
-                                Ok(()) => break,
-                                Err(_) => tracing::error!("async worker paniced"),
-                            }
-                        }
-                    })
-                    .expect("failed to spawn blocking worker thread")
-            })
-            .collect();
-
-        BLOCKING_TASKS
-            .set(send)
-            .expect("blocking task sender init twice");
-
-        Self {
+        Ok(Self {
             workers,
-            blocking_workers,
-        }
+            closer,
+            _marker: PhantomData,
+        })
+    }
+
+    fn create_worker_handler(
+        worker_id: usize,
+        assigned: Arc<SegQueue<Runnable>>,
+        closer: Arc<Event>,
+    ) -> std::io::Result<WorkerHandler> {
+        #[cfg(feature = "io")]
+        use worker::NR_TASKS;
+
+        let local_assigned = Arc::clone(&assigned);
+
+        #[cfg(feature = "io")]
+        let mut poller = Poller::with_capacity(NR_TASKS)?;
+        #[cfg(feature = "io")]
+        let waker = Arc::new(poller.waker()?);
+        #[cfg(feature = "io")]
+        let local_waker = waker.clone();
+
+        let join = thread::Builder::new()
+            .name(format!("async-worker-{}", worker_id))
+            .spawn(move || {
+                let worker = Worker::new(
+                    worker_id,
+                    local_assigned,
+                    #[cfg(feature = "io")]
+                    poller,
+                    #[cfg(feature = "io")]
+                    local_waker,
+                );
+
+                loop {
+                    let closer = Arc::clone(&closer);
+                    match catch_unwind(|| {
+                        future::block_on(worker.run(async move {
+                            closer.listen().await;
+                        }));
+                    }) {
+                        Ok(_) => break,
+                        Err(_) => tracing::error!("async worker paniced"),
+                    }
+                }
+            })?;
+
+        Ok(WorkerHandler {
+            join,
+            assigned,
+            #[cfg(feature = "io")]
+            waker,
+        })
     }
 }
 
-impl Executor {
-    pub fn spawn_range<Fact, Fut>(&self, factory: Fact) -> Vec<Task<Fut::Output>>
+impl<'executor> Executor<'executor> {
+    pub fn run<MakeF, F>(&'executor self, maker: MakeF) -> Vec<F::Output>
     where
-        Fut: 'static + Future,
-        Fut::Output: 'static + Send,
-        Fact: 'static + Fn() -> Fut + Clone + Send + Sync,
+        F: 'executor + Future,
+        F::Output: 'executor + Send,
+        MakeF: 'executor + Fn() -> F + Clone + Send,
     {
-        self.workers
-            .iter()
-            .enumerate()
-            .map(|(id, worker)| {
+        future::block_on(join_all(self.workers.iter().enumerate().map(
+            |(id, worker)| {
                 let owned_thread = id;
                 let assigned = Arc::clone(&worker.assigned);
-                let factory = factory.clone();
+                let maker = maker.clone();
+
+                #[cfg(feature = "io")]
                 let schedule = schedule(owned_thread, assigned, Arc::clone(&worker.waker));
-                let (runnable, task) = unsafe {
-                    async_task::spawn_unchecked(async move { factory().await }, schedule)
-                };
+
+                #[cfg(not(feature = "io"))]
+                let schedule = schedule(owned_thread, assigned);
+
+                let (runnable, task) =
+                    unsafe { async_task::spawn_unchecked(async move { maker().await }, schedule) };
                 runnable.schedule();
+
+                #[cfg(feature = "io")]
+                worker
+                    .waker
+                    .wake()
+                    .expect("wake worker to accpet spawned task must be successed");
+
                 task
-            })
-            .collect()
+            },
+        )))
     }
 }
 
-pub fn spawn<F>(future: F) -> Task<F::Output>
-where
-    F: 'static + Future,
-    F::Output: 'static,
-{
-    spawn_unchecked(future)
-}
-
-pub fn scoped_spawn<'future, F>(future: F) -> ScopedTask<'future, F::Output>
+pub fn spawn<'future, F>(future: F) -> ScopedTask<'future, F::Output>
 where
     F: 'future + Future,
     F::Output: 'future,
 {
-    ScopedTask {
-        task: spawn_unchecked(future),
-        _marker: PhantomData,
-    }
+    ScopedTask::new(unsafe { spawn_unchecked(future) })
 }
 
-fn spawn_unchecked<F>(future: F) -> Task<F::Output>
+pub(crate) unsafe fn spawn_unchecked<F>(future: F) -> Task<F::Output>
 where
     F: Future,
 {
-    let owned_thread = ID.with(|id| {
-        *id.get()
-            .expect("spawn_local is called outside the worker thread")
+    #[cfg(not(feature = "io"))]
+    let (owned_thread, assigned, id) = CONTEXT.with(|context| {
+        let context = context.get().expect("context should be initialized");
+        (
+            context.id,
+            Arc::clone(&context.assigned),
+            context.active.borrow_mut().vacant_entry().key(),
+        )
     });
-    let (assigned, waker) = CONTEXT.with(|context| {
-        let context = unsafe { context.get().unwrap_unchecked() };
-        (Arc::clone(&context.assigned), Arc::clone(&context.waker))
+    #[cfg(not(feature = "io"))]
+    let schedule = schedule(owned_thread, assigned);
+
+    #[cfg(feature = "io")]
+    let (owned_thread, assigned, id, waker) = CONTEXT.with(|context| {
+        let context = context.get().expect("context should be initialized");
+        (
+            context.id,
+            Arc::clone(&context.assigned),
+            context.active.borrow_mut().vacant_entry().key(),
+            Arc::clone(&context.waker),
+        )
+    });
+    #[cfg(feature = "io")]
+    let schedule = schedule(owned_thread, assigned, waker);
+
+    let (runnable, task) = async_task::spawn_unchecked(
+        async move {
+            let _guard = CallOnDrop(|| {
+                CONTEXT.with(|context| {
+                    let context = context.get().expect("context should be initialized");
+                    context.active.borrow_mut().try_remove(id);
+                })
+            });
+            future.await
+        },
+        schedule,
+    );
+
+    CONTEXT.with(|context| {
+        let context = context.get().expect("context should be initialized");
+        context.active.borrow_mut().insert(runnable.waker());
     });
 
-    let schedule = schedule(owned_thread, assigned, waker);
-    let (runnable, task) = unsafe { async_task::spawn_unchecked(future, schedule) };
     runnable.schedule();
+
     task
 }
 
 fn schedule(
     owned_thread: usize,
     assigned: Arc<SegQueue<Runnable>>,
-    waker: Arc<mio::Waker>,
+    #[cfg(feature = "io")] waker: Arc<mio::Waker>,
 ) -> impl Fn(Runnable) {
     move |runnable| {
-        ID.with(|id| {
-            if let Some(&id) = id.get() {
+        CONTEXT.with(|context| {
+            if let Some(id) = context.get().map(|cx| cx.id) {
                 if id == owned_thread {
                     CONTEXT.with(|context| {
-                        let context = unsafe { context.get().unwrap_unchecked() };
+                        let context = context.get().expect("context should be initialized");
                         context.local.borrow_mut().push_back(runnable);
                     });
                     return;
                 }
             }
             assigned.push(runnable);
-            waker.wake().expect("wake worker failed");
+
+            #[cfg(feature = "io")]
+            waker
+                .wake()
+                .expect("wake worker by task scheduling must be ok");
         })
+    }
+}
+
+#[cfg(feature = "blocking")]
+pub fn unblock<T, F>(f: F) -> Task<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    blocking::Executor::spawn(async move { f() })
+}
+
+struct CallOnDrop<F: Fn()>(F);
+
+impl<F: Fn()> Drop for CallOnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn static_task() {
+        use crate::{spawn, Executor};
+
+        let hello_world = "hello world";
+        Executor::builder()
+            .worker_num(1)
+            .build()
+            .unwrap()
+            .run(|| async {
+                spawn(async move {
+                    let _ = hello_world;
+                })
+                .detach();
+            });
+    }
+
+    #[test]
+    fn unblock_task() {
+        use std::time::Duration;
+
+        use crate::{unblock, Executor};
+
+        Executor::builder()
+            .worker_num(1)
+            .max_blocking_thread_num(1)
+            .build()
+            .unwrap()
+            .run(|| async {
+                let step = Arc::new(AtomicUsize::new(1));
+                let inner_step = Arc::clone(&step);
+                let task = unblock(move || {
+                    std::thread::sleep(Duration::from_secs(1));
+                    debug_assert!(inner_step
+                        .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok());
+                });
+                debug_assert!(step
+                    .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok());
+                task.await;
+            });
     }
 }

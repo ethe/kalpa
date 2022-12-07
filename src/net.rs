@@ -1,45 +1,44 @@
 use std::{
     io,
     io::{IoSlice, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    os::fd::AsRawFd,
+    net::{Shutdown, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
 };
 
 use futures_lite::Stream;
-use mio::Interest;
+pub use mio::net::{TcpListener, TcpStream};
+use mio::{event::Source, Interest};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use super::worker::CONTEXT;
 
-#[derive(Debug)]
-pub struct Async<T: AsRawFd> {
+pub struct Async<T: Source> {
     io: T,
     id: usize,
 }
 
-impl<T: AsRawFd> Async<T> {
-    fn new(io: T) -> io::Result<Self> {
+impl<T: Source> Async<T> {
+    fn new(mut io: T) -> io::Result<Self> {
         let id = CONTEXT.with(|context| {
             context
                 .get()
                 .unwrap()
                 .poller
                 .borrow_mut()
-                .register(&io, Interest::READABLE | Interest::WRITABLE)
+                .register(&mut io, Interest::READABLE | Interest::WRITABLE)
         })?;
         Ok(Self { io, id })
     }
 }
 
-impl<T: AsRawFd> AsRef<T> for Async<T> {
+impl<T: Source> AsRef<T> for Async<T> {
     fn as_ref(&self) -> &T {
         &self.io
     }
 }
 
-impl<T: AsRawFd> Drop for Async<T> {
+impl<T: Source> Drop for Async<T> {
     fn drop(&mut self) {
         CONTEXT.with(|context| {
             context
@@ -47,7 +46,7 @@ impl<T: AsRawFd> Drop for Async<T> {
                 .unwrap()
                 .poller
                 .borrow_mut()
-                .deregister(self.id, &self.io)
+                .deregister(self.id, &mut self.io)
         });
     }
 }
@@ -64,7 +63,7 @@ impl Async<TcpListener> {
         socket.set_reuse_port(true)?;
         socket.bind(&address.into())?;
         socket.listen(32768)?;
-        Async::new(socket.into())
+        Async::new(TcpListener::from_std(socket.into()))
     }
 }
 
@@ -73,10 +72,7 @@ impl Stream for Async<TcpListener> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.as_ref().io.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(true)?;
-                Poll::Ready(Some(Async::new(stream)))
-            }
+            Ok((stream, _)) => Poll::Ready(Some(Async::new(stream))),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 CONTEXT.with(|context| {
                     context
@@ -95,23 +91,11 @@ impl Stream for Async<TcpListener> {
 
 impl Async<TcpStream> {
     pub fn connect(address: SocketAddr) -> io::Result<Self> {
-        let socket_type = Type::STREAM.nonblocking();
-        let socket = Socket::new(
-            Domain::for_address(address),
-            socket_type,
-            Some(Protocol::TCP),
-        )?;
-        match socket.connect(&address.into()) {
-            Ok(_) => {}
-            #[cfg(unix)]
-            Err(err) if err.raw_os_error() == Some(libc::EINPROGRESS) => {}
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err),
-        }
-        Async::new(socket.into())
+        Async::new(TcpStream::connect(address)?)
     }
 }
 
+#[cfg(feature = "tokio")]
 impl tokio::io::AsyncRead for Async<TcpStream> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -144,6 +128,7 @@ impl tokio::io::AsyncRead for Async<TcpStream> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl tokio::io::AsyncWrite for Async<TcpStream> {
     fn poll_write(
         mut self: Pin<&mut Self>,
