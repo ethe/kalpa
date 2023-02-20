@@ -10,7 +10,6 @@ use std::{
     future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
-    panic::catch_unwind,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -235,14 +234,9 @@ impl<'executor> Executor<'executor> {
 
                 loop {
                     let closer = Arc::clone(&closer);
-                    match catch_unwind(|| {
-                        future::block_on(worker.run(async move {
-                            closer.listen().await;
-                        }));
-                    }) {
-                        Ok(_) => break,
-                        Err(_) => tracing::error!("async worker paniced"),
-                    }
+                    future::block_on(worker.run(async move {
+                        closer.listen().await;
+                    }));
                 }
             })?;
 

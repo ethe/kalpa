@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    panic,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Condvar, Mutex, MutexGuard,
@@ -90,7 +89,7 @@ impl Executor {
                 self.grow_pool(inner);
 
                 // Run the task.
-                panic::catch_unwind(|| runnable.run()).ok();
+                runnable.run();
 
                 // Re-lock the inner state and continue.
                 inner = self.inner.lock().unwrap();
