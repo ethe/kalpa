@@ -136,7 +136,7 @@ impl Worker {
         };
 
         // Run `future` and `run_forever` concurrently until `future` completes.
-        future::race(future, run_forever).await;
+        future::or(future, run_forever).await;
     }
 }
 

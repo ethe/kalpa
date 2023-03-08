@@ -20,11 +20,10 @@ use std::{
 use async_task::{Runnable, Task};
 use crossbeam_queue::SegQueue;
 use event_listener::Event;
-use futures_lite::{future, pin};
+use futures_lite::future;
 use futures_util::future::join_all;
 #[cfg(feature = "blocking")]
 use once_cell::sync::OnceCell;
-use waker_fn::waker_fn;
 pub use worker::CONTEXT;
 
 #[cfg(feature = "io")]
@@ -56,14 +55,8 @@ impl<T> Future for ScopedTask<'_, T> {
 impl<T> Drop for ScopedTask<'_, T> {
     fn drop(&mut self) {
         let task =
-            unsafe { std::mem::replace(&mut self.task, MaybeUninit::uninit()).assume_init() }
-                .cancel();
-        pin!(task);
-        let waker = waker_fn(move || {});
-        let mut cx = Context::from_waker(&waker);
-        if task.as_mut().poll(&mut cx).is_pending() {
-            panic!("cancel scoped task should always success immediately");
-        }
+            unsafe { std::mem::replace(&mut self.task, MaybeUninit::uninit()).assume_init() };
+        drop(task);
     }
 }
 
