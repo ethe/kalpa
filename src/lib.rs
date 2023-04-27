@@ -6,16 +6,7 @@ pub mod io;
 pub mod net;
 mod worker;
 
-use std::{
-    future::Future,
-    marker::PhantomData,
-    mem::MaybeUninit,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    thread,
-    thread::JoinHandle,
-};
+use std::{future::Future, marker::PhantomData, sync::Arc, thread, thread::JoinHandle};
 
 use async_task::{Runnable, Task};
 use crossbeam_queue::SegQueue;
@@ -32,57 +23,6 @@ use self::worker::Worker;
 
 #[cfg(feature = "blocking")]
 static BLOCKING_EXECUTOR: OnceCell<blocking::Executor> = OnceCell::new();
-
-#[must_use = "because it must be awaited in its lifetime"]
-#[repr(transparent)]
-pub struct ScopedTask<'task, T> {
-    task: MaybeUninit<Task<T>>,
-    _marker: PhantomData<&'task &'task mut ()>,
-}
-
-impl<T> std::panic::UnwindSafe for ScopedTask<'_, T> {}
-impl<T> std::panic::RefUnwindSafe for ScopedTask<'_, T> {}
-
-impl<T> Future for ScopedTask<'_, T> {
-    type Output = T;
-
-    #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe { self.map_unchecked_mut(|st| st.task.assume_init_mut()) }.poll(cx)
-    }
-}
-
-impl<T> Drop for ScopedTask<'_, T> {
-    fn drop(&mut self) {
-        let task =
-            unsafe { std::mem::replace(&mut self.task, MaybeUninit::uninit()).assume_init() };
-        drop(task);
-    }
-}
-
-impl<T> ScopedTask<'_, T> {
-    #[inline]
-    fn new(task: Task<T>) -> Self {
-        ScopedTask {
-            task: MaybeUninit::new(task),
-            _marker: PhantomData,
-        }
-    }
-
-    #[inline]
-    pub fn is_finished(&self) -> bool {
-        unsafe { self.task.assume_init_ref() }.is_finished()
-    }
-}
-
-impl<T> ScopedTask<'static, T> {
-    #[inline]
-    pub fn detach(mut self) {
-        let task = std::mem::replace(&mut self.task, MaybeUninit::uninit());
-        std::mem::forget(self);
-        unsafe { task.assume_init() }.detach()
-    }
-}
 
 pub struct ExecutorBuilder<'executor> {
     worker_num: usize,
@@ -277,12 +217,12 @@ impl<'executor> Executor<'executor> {
     }
 }
 
-pub fn spawn<'future, F>(future: F) -> ScopedTask<'future, F::Output>
+pub fn spawn<F>(future: F) -> Task<F::Output>
 where
-    F: 'future + Future,
-    F::Output: 'future,
+    F: 'static + Future,
+    F::Output: 'static,
 {
-    ScopedTask::new(unsafe { spawn_unchecked(future) })
+    unsafe { spawn_unchecked(future) }
 }
 
 pub(crate) unsafe fn spawn_unchecked<F>(future: F) -> Task<F::Output>

@@ -75,12 +75,11 @@ impl Stream for Async<TcpListener> {
             Ok((stream, _)) => Poll::Ready(Some(Async::new(stream))),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 CONTEXT.with(|context| {
-                    context
-                        .get()
-                        .unwrap()
-                        .poller
-                        .borrow_mut()
-                        .add(self.id, cx.waker().clone())
+                    context.get().unwrap().poller.borrow_mut().add(
+                        self.id,
+                        cx.waker().clone(),
+                        Interest::READABLE,
+                    )
                 });
                 Poll::Pending
             }
@@ -108,12 +107,11 @@ impl tokio::io::AsyncRead for Async<TcpStream> {
             match self.io.read(bytes) {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     CONTEXT.with(|context| {
-                        context
-                            .get()
-                            .unwrap()
-                            .poller
-                            .borrow_mut()
-                            .add(self.id, cx.waker().clone())
+                        context.get().unwrap().poller.borrow_mut().add(
+                            self.id,
+                            cx.waker().clone(),
+                            Interest::READABLE,
+                        )
                     });
                     Poll::Pending
                 }
@@ -138,12 +136,11 @@ impl tokio::io::AsyncWrite for Async<TcpStream> {
         match self.io.write(buf) {
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 CONTEXT.with(|context| {
-                    context
-                        .get()
-                        .unwrap()
-                        .poller
-                        .borrow_mut()
-                        .add(self.id, cx.waker().clone())
+                    context.get().unwrap().poller.borrow_mut().add(
+                        self.id,
+                        cx.waker().clone(),
+                        Interest::WRITABLE,
+                    )
                 });
                 Poll::Pending
             }
@@ -167,12 +164,11 @@ impl tokio::io::AsyncWrite for Async<TcpStream> {
         match self.io.write_vectored(bufs) {
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 CONTEXT.with(|context| {
-                    context
-                        .get()
-                        .unwrap()
-                        .poller
-                        .borrow_mut()
-                        .add(self.id, cx.waker().clone())
+                    context.get().unwrap().poller.borrow_mut().add(
+                        self.id,
+                        cx.waker().clone(),
+                        Interest::WRITABLE,
+                    )
                 });
                 Poll::Pending
             }

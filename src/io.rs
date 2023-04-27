@@ -5,10 +5,16 @@ use mio::{event, Events, Poll, Token};
 use slab::Slab;
 
 #[derive(Debug)]
+struct WakerInterests {
+    interests: Interest,
+    waker: Waker,
+}
+
+#[derive(Debug)]
 pub struct Poller {
     poller: Poll,
     events: Events,
-    active: Slab<Option<Waker>>,
+    active: Slab<Slab<WakerInterests>>,
 }
 
 impl Poller {
@@ -28,8 +34,26 @@ impl Poller {
                 .get_mut(event.token().0)
                 .expect("io event is registered but not found in poller");
 
-            if let Some(waker) = waker.take() {
-                waker.wake();
+            let mut id = None;
+
+            let is = if event.is_readable() {
+                Interest::is_readable
+            } else if event.is_writable() {
+                Interest::is_writable
+            } else {
+                continue;
+            };
+
+            for (i, waker) in waker.iter() {
+                if is(waker.interests) {
+                    id = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(id) = id {
+                let waker = waker.remove(id);
+                waker.waker.wake();
             }
         }
         self.events.clear();
@@ -37,7 +61,10 @@ impl Poller {
     }
 
     pub(crate) fn waker(&mut self) -> io::Result<mio::Waker> {
-        mio::Waker::new(self.poller.registry(), Token(self.active.insert(None)))
+        mio::Waker::new(
+            self.poller.registry(),
+            Token(self.active.insert(Slab::new())),
+        )
     }
 
     pub fn register<S>(&mut self, source: &mut S, interests: Interest) -> io::Result<usize>
@@ -49,12 +76,15 @@ impl Poller {
         self.poller
             .registry()
             .register(source, Token(key), interests)?;
-        entry.insert(None);
+        entry.insert(Slab::with_capacity(2));
         Ok(key)
     }
 
-    pub fn add(&mut self, id: usize, waker: Waker) {
-        *self.active.get_mut(id).unwrap() = Some(waker);
+    pub fn add(&mut self, id: usize, waker: Waker, interests: Interest) {
+        self.active
+            .get_mut(id)
+            .unwrap()
+            .insert(WakerInterests { interests, waker });
     }
 
     pub fn deregister<S>(&mut self, id: usize, source: &mut S)
