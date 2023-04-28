@@ -5,16 +5,16 @@ use mio::{event, Events, Poll, Token};
 use slab::Slab;
 
 #[derive(Debug)]
-struct WakerInterests {
-    interests: Interest,
-    waker: Waker,
+struct Wakers {
+    reader: Option<Waker>,
+    writer: Option<Waker>,
 }
 
 #[derive(Debug)]
 pub struct Poller {
     poller: Poll,
     events: Events,
-    active: Slab<Slab<WakerInterests>>,
+    active: Slab<Wakers>,
 }
 
 impl Poller {
@@ -29,31 +29,20 @@ impl Poller {
     pub(crate) fn poll(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         self.poller.poll(&mut self.events, timeout)?;
         for event in &self.events {
-            let waker = self
+            let wakers = self
                 .active
                 .get_mut(event.token().0)
                 .expect("io event is registered but not found in poller");
 
-            let mut id = None;
-
-            let is = if event.is_readable() {
-                Interest::is_readable
-            } else if event.is_writable() {
-                Interest::is_writable
-            } else {
-                continue;
-            };
-
-            for (i, waker) in waker.iter() {
-                if is(waker.interests) {
-                    id = Some(i);
-                    break;
+            if event.is_readable() {
+                if let Some(waker) = wakers.reader.take() {
+                    waker.wake();
                 }
             }
-
-            if let Some(id) = id {
-                let waker = waker.remove(id);
-                waker.waker.wake();
+            if event.is_writable() {
+                if let Some(waker) = wakers.writer.take() {
+                    waker.wake();
+                }
             }
         }
         self.events.clear();
@@ -63,7 +52,10 @@ impl Poller {
     pub(crate) fn waker(&mut self) -> io::Result<mio::Waker> {
         mio::Waker::new(
             self.poller.registry(),
-            Token(self.active.insert(Slab::new())),
+            Token(self.active.insert(Wakers {
+                reader: None,
+                writer: None,
+            })),
         )
     }
 
@@ -76,15 +68,20 @@ impl Poller {
         self.poller
             .registry()
             .register(source, Token(key), interests)?;
-        entry.insert(Slab::with_capacity(2));
+        entry.insert(Wakers {
+            reader: None,
+            writer: None,
+        });
         Ok(key)
     }
 
-    pub fn add(&mut self, id: usize, waker: Waker, interests: Interest) {
-        self.active
-            .get_mut(id)
-            .unwrap()
-            .insert(WakerInterests { interests, waker });
+    pub fn add(&mut self, id: usize, waker: Waker, interest: Interest) {
+        let wakers: &mut Wakers = self.active.get_mut(id).unwrap();
+        if interest.is_readable() {
+            wakers.reader = Some(waker);
+        } else if interest.is_writable() {
+            wakers.writer = Some(waker);
+        }
     }
 
     pub fn deregister<S>(&mut self, id: usize, source: &mut S)
